@@ -19,15 +19,19 @@ package main
 
 import (
 	"bufio"
+	"context"
 	"encoding/json"
 	"flag"
 	"fmt"
 	"io"
+	"net/url"
 	"os"
+	"strconv"
 	"time"
 
 	log "github.com/Sirupsen/logrus"
 	"github.com/pkg/errors"
+	kafka "github.com/segmentio/kafka-go"
 	"gopkg.in/yaml.v2"
 
 	"github.com/elastic/go-libaudit"
@@ -36,13 +40,15 @@ import (
 )
 
 var (
-	fs        = flag.NewFlagSet("auparse", flag.ExitOnError)
-	debug     = fs.Bool("d", false, "enable debug output to stderr")
-	in        = fs.String("in", "-", "input file (defaults to stdin)")
-	out       = fs.String("out", "-", "output file (defaults to stdout)")
-	interpret = fs.Bool("i", false, "interpret and normalize messages")
-	idLookup  = fs.Bool("id", true, "lookup uid and gid values in messages (requires -i)")
-	format    = fs.String("format", "", "output format, possible values - json, yaml, text (default)")
+	fs            = flag.NewFlagSet("auparse", flag.ExitOnError)
+	debug         = fs.Bool("d", false, "enable debug output to stderr")
+	in            = fs.String("in", "-", "input file (defaults to stdin)")
+	out           = fs.String("out", "-", "output file (defaults to stdout)")
+	interpret     = fs.Bool("i", false, "interpret and normalize messages")
+	idLookup      = fs.Bool("id", true, "lookup uid and gid values in messages (requires -i)")
+	format        = fs.String("format", "", "output format, possible values - json, yaml, text (default)")
+	kafkaLocation = fs.String("kafka", "", "kafka url (for example: tcp://localhost:9092/?topic=name&partition=0)")
+	appendNewLine = true
 )
 
 func enableLogger() {
@@ -80,7 +86,38 @@ func output() (io.WriteCloser, error) {
 		return os.Stdout, nil
 	}
 
-	return os.OpenFile(*out, os.O_CREATE|os.O_RDWR|os.O_TRUNC, 0600)
+	if *kafkaLocation == "" {
+		return os.OpenFile(*out, os.O_CREATE|os.O_RDWR|os.O_TRUNC, 0600)
+	}
+
+	kafkaURL, err := url.Parse(*kafkaLocation)
+	if err != nil {
+		return nil, err
+	}
+
+	partition := 0
+	partitionStr := kafkaURL.Query().Get("partition")
+	if partitionStr != "" {
+		partitionInt, err := strconv.ParseInt(partitionStr, 10, 32)
+		if err != nil {
+			return nil, err
+		}
+		partition = int(partitionInt)
+	}
+
+	kafkaConn, err := kafka.DialLeader(
+		context.Background(),
+		kafkaURL.Scheme,
+		kafkaURL.Host,
+		kafkaURL.Query().Get("topic"),
+		partition,
+	)
+	if err != nil {
+		return nil, err
+	}
+	appendNewLine = false
+
+	return kafkaConn, nil
 }
 
 func processLogs() error {
@@ -210,7 +247,9 @@ func (s *streamHandler) printJSON(v interface{}) error {
 		return err
 	}
 	s.output.Write(jsonBytes)
-	s.output.Write([]byte("\n"))
+	if appendNewLine {
+		s.output.Write([]byte("\n"))
+	}
 	return nil
 }
 
